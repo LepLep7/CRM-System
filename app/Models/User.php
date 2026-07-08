@@ -29,4 +29,24 @@ class User extends Authenticatable
             'password' => 'hashed',
         ];
     }
+
+    public function department()
+    {
+        return $this->belongsTo(Department::class);
+    }
+
+    public function team()
+    {
+        return $this->belongsTo(Team::class);
+    }
+
+    public function pipelines()
+    {
+        return $this->hasMany(Pipeline::class, 'salesperson_id');
+    }
+
+    public function managedTeam()
+    {
+        return $this->hasOne(Team::class, 'manager_id');
+    }
 }
