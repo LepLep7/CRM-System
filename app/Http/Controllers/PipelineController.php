@@ -7,6 +7,7 @@ use App\Models\Pipeline;
 use Illuminate\Http\Request;
 use App\Http\Requests\UpdatePipelineRequest;
 use Illuminate\Support\Facades\Storage;
+use App\Services\PipelineStageService;
 
 class PipelineController extends Controller
 {
@@ -85,12 +86,23 @@ class PipelineController extends Controller
             'verbal', 'contract', 'loss', 'renewal', 'decline',
         ];
 
-        // Manager/Admin can pick any stage (including rollback). Others only see current + valid forward moves.
         $stageOptions = in_array($request->user()->role, ['manager', 'admin'])
             ? $allStages
             : array_values(array_unique(array_merge([$pipeline->stage], $allowedNextStages)));
 
-        return view('pipelines.edit', compact('pipeline', 'stageOptions'));
+        $mainPath = ['new', 'qualify', 'proposal_submitted', 'shortlisted', 'verbal', 'contract', 'renewal'];
+        $currentIndex = array_search($pipeline->stage, $mainPath);
+        $showProposalGroup = $currentIndex === false || $currentIndex >= array_search('qualify', $mainPath);
+        $showContractGroup = $currentIndex === false || $currentIndex >= array_search('verbal', $mainPath);
+
+        $scopeOptions = \App\Models\DropdownOption::category('scope_of_service')->active()->pluck('value');
+        $countryOptions = \App\Models\DropdownOption::category('country')->active()->pluck('value');
+        $portOptions = \App\Models\DropdownOption::category('port')->active()->pluck('value');
+
+        return view('pipelines.edit', compact(
+            'pipeline', 'stageOptions', 'showProposalGroup', 'showContractGroup',
+            'scopeOptions', 'countryOptions', 'portOptions'
+        ));
     }
 
     public function update(UpdatePipelineRequest $request, Pipeline $pipeline)
@@ -173,5 +185,160 @@ class PipelineController extends Controller
 
         return redirect()->route('pipelines.index')
             ->with('success', 'Pipeline deleted.');
+    }
+
+    protected array $autosaveFields = [
+        'project_name' => 'string', 'chance_level' => 'chance_level',
+        'expected_start_date' => 'date', 'scope_of_service' => 'dropdown:scope_of_service',
+        'customer_product' => 'string', 'value_per_annum' => 'decimal',
+        'contract_period' => 'string', 'number_of_months' => 'integer',
+        'origin_country' => 'dropdown:country', 'port_of_loading' => 'dropdown:port',
+        'destination_country' => 'dropdown:country', 'port_of_destination' => 'dropdown:port',
+        'operating_profit_margin' => 'decimal', 'remarks_proposal' => 'string',
+        'date_secured' => 'date', 'date_go_live' => 'date', 'remarks_contract' => 'string',
+    ];
+
+    protected array $chanceLevelMap = ['low' => 25, 'medium' => 50, 'high' => 75];
+
+    public function autosaveField(Request $request, Pipeline $pipeline)
+    {
+        $this->authorize('update', $pipeline);
+
+        if ($pipeline->is_locked && ! in_array($request->user()->role, ['manager', 'admin'])) {
+            return response()->json(['error' => 'This pipeline is locked.'], 403);
+        }
+
+        $field = $request->input('field');
+        $value = $request->input('value');
+
+        if (! array_key_exists($field, $this->autosaveFields)) {
+            return response()->json(['error' => 'Invalid field.'], 422);
+        }
+
+        $type = $this->autosaveFields[$field];
+
+        if ($type === 'chance_level') {
+            if (! array_key_exists($value, $this->chanceLevelMap) && $value !== '') {
+                return response()->json(['error' => 'Invalid chance level.'], 422);
+            }
+
+            $pipeline->update([
+                'chance_level' => $value === '' ? null : $value,
+                'chance_percent' => $value === '' ? null : $this->chanceLevelMap[$value],
+            ]);
+
+            return response()->json(['success' => true]);
+        }
+
+        if (str_starts_with($type, 'dropdown:')) {
+            $category = substr($type, 9);
+
+            if ($value !== '' && ! \App\Models\DropdownOption::category($category)->active()->where('value', $value)->exists()) {
+                return response()->json(['error' => 'Invalid option selected.'], 422);
+            }
+
+            $pipeline->update([$field => $value === '' ? null : $value]);
+
+            return response()->json(['success' => true]);
+        }
+
+        $rules = match ($type) {
+            'integer' => 'nullable|integer',
+            'decimal' => 'nullable|numeric',
+            'date' => 'nullable|date|after_or_equal:today',
+            default => 'nullable|string|max:2000',
+        };
+
+        $validator = validator(['value' => $value], ['value' => $rules]);
+        if ($validator->fails()) {
+            return response()->json(['error' => $validator->errors()->first('value')], 422);
+        }
+
+        $pipeline->update([$field => $value === '' ? null : $value]);
+
+        if ($field === 'contract_period' && $value === 'long_term') {
+            $pipeline->update(['number_of_months' => 12]);
+        }
+
+        return response()->json(['success' => true]);
+    }
+
+    public function uploadAttachment(Request $request, Pipeline $pipeline)
+    {
+        $this->authorize('update', $pipeline);
+
+        $request->validate([
+            'category' => 'required|in:quotation,contract',
+            'file' => 'required|file|mimes:pdf,doc,docx,xls,xlsx,jpg,jpeg,png|max:10240',
+        ]);
+
+        $path = $request->file('file')->store('attachments/' . $request->category, 'public');
+
+        $attachment = $pipeline->attachments()->create([
+            'uploaded_by' => $request->user()->id,
+            'category' => $request->category,
+            'original_name' => $request->file('file')->getClientOriginalName(),
+            'file_path' => $path,
+            'mime_type' => $request->file('file')->getClientMimeType(),
+            'size' => $request->file('file')->getSize(),
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'attachment' => [
+                'id' => $attachment->id,
+                'name' => $attachment->original_name,
+                'url' => Storage::url($attachment->file_path),
+            ],
+        ]);
+    }
+
+    public function advanceStage(Request $request, Pipeline $pipeline, PipelineStageService $stageService)
+    {
+        $this->authorize('update', $pipeline);
+
+        $request->validate([
+            'target_stage' => 'required|in:' . implode(',', array_keys($stageService->allowedTransitions)),
+        ]);
+
+        $targetStage = $request->input('target_stage');
+        $isForward = $stageService->isForwardTransition($pipeline->stage, $targetStage);
+
+        if (! $isForward && ! in_array($request->user()->role, ['manager', 'admin'])) {
+            return response()->json(['errors' => ['Only a Manager or Admin can move a pipeline back to a previous stage.']], 403);
+        }
+
+        $errors = $stageService->missingFieldsForStage($pipeline, $targetStage);
+        if (! empty($errors)) {
+            return response()->json(['errors' => $errors], 422);
+        }
+
+        $updates = ['stage' => $targetStage];
+
+        if ($targetStage === 'qualify' && ! $pipeline->date_funnel) {
+            $updates['date_funnel'] = now();
+        }
+        if (! empty($pipeline->date_secured) && ! empty($pipeline->value_per_annum)) {
+            $updates['forecast_revenue'] = $pipeline->value_per_annum;
+        }
+        if ($targetStage === 'contract') {
+            $updates['is_locked'] = true;
+        }
+
+        $pipeline->stageHistories()->create([
+            'changed_by' => $request->user()->id,
+            'from_stage' => $pipeline->stage,
+            'to_stage' => $targetStage,
+            'is_rollback' => ! $isForward,
+            'approved_by' => ! $isForward ? $request->user()->id : null,
+        ]);
+
+        $pipeline->update($updates);
+
+        return response()->json([
+            'success' => true,
+            'redirect' => route('pipelines.edit', $pipeline),
+            'message' => 'Stage advanced to ' . ucwords(str_replace('_', ' ', $targetStage)) . '.',
+        ]);
     }
 }

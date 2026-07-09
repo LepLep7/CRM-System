@@ -11,7 +11,7 @@ class Pipeline extends Model
 
     protected $fillable = [
         'customer_id', 'salesperson_id', 'department_id', 'stage',
-        'project_name', 'chance_percent', 'expected_start_date',
+        'project_name', 'chance_percent', 'chance_level', 'expected_start_date',
         'scope_of_service', 'customer_product', 'date_funnel',
         'value_per_annum', 'contract_period', 'number_of_months',
         'origin_country', 'port_of_loading', 'destination_country',
